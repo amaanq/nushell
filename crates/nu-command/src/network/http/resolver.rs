@@ -1,6 +1,6 @@
 use std::{
     error, fmt, io,
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
 };
 
 use http::Uri;
@@ -20,25 +20,34 @@ impl Resolver for DnsLookupResolver {
         config: &Config,
         _timeout: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let host = uri.host();
+        let host = uri.host().unwrap_or("");
         // Determine the port: use explicit port if provided, otherwise derive from scheme
         let port = uri.port_u16().unwrap_or_else(|| match uri.scheme_str() {
             Some("https") => 443,
             _ => 80, // http commands only support HTTP/HTTPS, default to port 80
         });
 
-        // Pass None as service to avoid "Service not supported for this socket type" errors
-        // in certain environments (e.g., Docker containers on some Linux distributions).
-        // We'll set the port manually on each resolved address.
-        let addr_info_iter = dns_lookup::getaddrinfo(host, None, None)
-            .map_err(|err| ureq::Error::Other(Box::new(LookupError(err))))?;
+        // Resolve using ToSocketAddrs which correctly handles all address
+        // formats including bracketed IPv6 literals like "[::1]:8002".
+        let addr = format!("{host}:{port}");
+        let addrs = match addr.to_socket_addrs() {
+            Ok(addrs) => addrs,
+            Err(_) => {
+                // Re-resolve through getaddrinfo to get a specific LookupErrorKind
+                // (NoName, Again, etc.) for better error messages.
+                return Err(ureq::Error::Other(Box::new(
+                    getaddrinfo_error(host, port),
+                )));
+            }
+        };
 
         let ip_family = config.ip_family();
         let mut resolved = self.empty();
         let capacity = array_vec_capacity(&resolved);
-        for addr_info in addr_info_iter {
-            let addr_info = addr_info?;
-            let sockaddr = addr_info.sockaddr;
+        for sockaddr in addrs {
+            // ToSocketAddrs already sets the port, but ensure it via set_port
+            // for consistency with the port we derived from the URI.
+            let sockaddr = set_port(sockaddr, port);
             // Filter addresses based on configured IP family (IPv4 only, IPv6 only, or any)
             let is_wanted = match ip_family {
                 ureq::config::IpFamily::Any => true,
@@ -46,9 +55,7 @@ impl Resolver for DnsLookupResolver {
                 ureq::config::IpFamily::Ipv6Only => sockaddr.is_ipv6(),
             };
             if is_wanted {
-                // Set the correct port on the resolved address
-                let sockaddr_with_port = set_port(sockaddr, port);
-                resolved.push(sockaddr_with_port);
+                resolved.push(sockaddr);
                 // ArrayVec has a fixed capacity, stop when full
                 if resolved.len() >= capacity {
                     break;
@@ -57,6 +64,33 @@ impl Resolver for DnsLookupResolver {
         }
 
         Ok(resolved)
+    }
+}
+
+/// Re-resolve via dns_lookup::getaddrinfo to get a detailed LookupError
+/// with a specific error kind (NoName, Again, Fail, etc.).
+fn getaddrinfo_error(host: &str, port: u16) -> LookupError {
+    // Strip brackets from IPv6 literals since getaddrinfo doesn't accept them.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match dns_lookup::getaddrinfo(Some(host), None, None) {
+        Err(err) => LookupError(err),
+        Ok(iter) => {
+            // getaddrinfo succeeded but ToSocketAddrs failed — shouldn't happen,
+            // but consume the iterator and produce the first error if any.
+            for result in iter {
+                if let Err(err) = result {
+                    return LookupError(dns_lookup::LookupError::from(err));
+                }
+            }
+            // Both succeeded somehow — produce a generic IO error.
+            LookupError(dns_lookup::LookupError::from(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to resolve {host}:{port}"),
+            )))
+        }
     }
 }
 
@@ -96,3 +130,31 @@ impl fmt::Display for LookupError {
 }
 
 impl error::Error for LookupError {}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+
+    #[test]
+    fn to_socket_addrs_handles_bracketed_ipv6() {
+        // This is the core invariant: ToSocketAddrs correctly parses
+        // bracketed IPv6 from http::Uri::host() combined with a port,
+        // which getaddrinfo cannot do.
+        let addrs: Vec<_> = "[::1]:8002".to_socket_addrs().unwrap().collect();
+        assert_eq!(addrs[0].ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addrs[0].port(), 8002);
+    }
+
+    #[test]
+    fn to_socket_addrs_handles_ipv4() {
+        let addrs: Vec<_> = "127.0.0.1:9090".to_socket_addrs().unwrap().collect();
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addrs[0].port(), 9090);
+    }
+
+    #[test]
+    fn to_socket_addrs_handles_hostname() {
+        let addrs: Vec<_> = "localhost:3000".to_socket_addrs().unwrap().collect();
+        assert_eq!(addrs[0].port(), 3000);
+    }
+}
